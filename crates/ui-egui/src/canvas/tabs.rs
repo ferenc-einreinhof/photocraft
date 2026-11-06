@@ -764,15 +764,22 @@ pub(super) fn open_on_double_click(app: &mut PhotocraftApp, ui: &egui::Ui, area:
 /// Extra OS windows showing documents (multi-window / multi-monitor).
 pub fn extra_windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let wins = app.ui.windows.clone();
+    // The documents whose last window was closed this frame, by id: closing one renumbers the rest.
+    let mut closing = Vec::new();
+    // In front of the main window while the app is in use (`doc_window_level`).
+    let level = super::doc_window_level::frame_level(app, ctx, wins.iter().any(|w| w.open));
     for w in wins.into_iter().filter(|w| w.open) {
         let Some(st) = app.session.documents().get(w.document) else { continue };
         let title = format!("{} — window {}", st.doc.name, w.id);
         let vid = egui::ViewportId::from_hash_of(("docwin", w.id));
-        let mut builder = crate::os_window::builder().with_title(title).with_inner_size([800.0, 600.0]);
+        let mut builder = crate::os_window::builder().with_title(title).with_inner_size([800.0, 600.0]).with_window_level(level);
         if let Some([x, y]) = w.position {
             builder = builder.with_position([x, y]);
         }
-        let mut view = w.view.clone();
+        // A window that owns its document (`floating`: it has no tab) draws the document's stored
+        // view, the one View › Zoom In/Out, Fit on Screen, the zoom field and the Navigator
+        // change; a second view (New Window for Document) keeps a view of its own.
+        let mut view = if w.floating { app.ui.views.get(w.document).cloned().unwrap_or_else(|| w.view.clone()) } else { w.view.clone() };
         let mut close = false;
         let mut focused = false;
         let mut keys = Vec::new();
@@ -815,6 +822,15 @@ pub fn extra_windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 focus_active_document(app, ctx);
             }
         }
+        if w.floating
+            && let Some(stored) = app.ui.views.get_mut(w.document)
+        {
+            *stored = view.clone();
+        }
+        if close && closes_document(app, &w) {
+            close = false;
+            closing.extend(app.session.documents().get(w.document).map(|d| d.doc.id));
+        }
         if let Some(win) = app.ui.windows.iter_mut().find(|x| x.id == w.id) {
             win.view = view;
             win.focused = focused;
@@ -824,6 +840,51 @@ pub fn extra_windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
     }
     app.ui.windows.retain(|w| w.open);
+    // After the loop: closing a document renumbers the documents the other windows show.
+    close_documents(app, ctx, closing);
+}
+
+/// Close the documents whose last window was closed (`ids`), each resolved by id against the
+/// documents as they are now, since closing one renumbers the rest. Once one asks about unsaved
+/// changes the rest wait: their windows stay open, so nothing is lost, and closing them again
+/// asks in turn.
+fn close_documents(app: &mut PhotocraftApp, ctx: &egui::Context, ids: Vec<photocraft_doc::DocId>) {
+    for id in ids {
+        if app.discard.is_some() {
+            break;
+        }
+        if let Some(index) = app.session.documents().iter().position(|d| d.doc.id == id) {
+            close_document(app, ctx, index);
+        }
+    }
+}
+
+#[cfg(test)]
+mod close_tests;
+
+/// Closing `window` closes its document, as in Photoshop, when it is the document's last view: it
+/// floats (the document has no tab) and no other window shows the document. Closing a second view
+/// (New Window for Document) only closes that window.
+fn closes_document(app: &PhotocraftApp, window: &crate::state::DocWindow) -> bool {
+    window.floating && !app.ui.windows.iter().any(|other| other.open && other.id != window.id && other.document == window.document)
+}
+
+/// File › Close for document `index`, whose window's close button was clicked: unsaved changes ask
+/// Save / Don't Save / Cancel first (in the main window, which comes forward). The window stays
+/// open meanwhile; closing the document takes it away with it, and Cancel keeps both.
+fn close_document(app: &mut PhotocraftApp, ctx: &egui::Context, index: usize) {
+    // A second click while the question is up asks nothing new.
+    if app.discard.is_some() {
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        return;
+    }
+    if let Err(e) = crate::menus::invoke(app, ctx, "file.close", json!({"document": index})) {
+        app.ui.status = e;
+        app.ui.status_error = true;
+    }
+    if app.discard.is_some() {
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+    }
 }
 
 #[cfg(test)]
