@@ -821,6 +821,8 @@ pub fn extra_windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
         let mut view = if w.floating { app.ui.views.get(w.document).cloned().unwrap_or(own) } else { own };
         let mut close = false;
         let mut focused = false;
+        let mut keys = Vec::new();
+        let mut modifiers = egui::Modifiers::default();
         ctx.show_viewport_immediate(vid, builder, |ui, class| {
             if ui.ctx().input(|i| i.viewport().close_requested()) {
                 close = true;
@@ -840,7 +842,30 @@ pub fn extra_windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 let ppp = ui.ctx().pixels_per_point();
                 ui.ctx().data_mut(|d| d.insert_temp(window_canvas_id(w.id), (rect.size(), ppp)));
             });
+            // An embedded window reads the main window's input, which runs the shortcuts itself.
+            if focused && class == egui::ViewportClass::Immediate {
+                (keys, modifiers) = leftover_keys(ui.ctx());
+            }
         });
+        if !keys.is_empty() {
+            // Keys pressed in this window run the main window's shortcuts (tool keys, undo, Free
+            // Transform, Enter/Escape), as floating panels' windows do. The shortcuts act on the
+            // active document's stored view, which this focused window wrote back in its pass:
+            // a zoom or fit they made there is this window's (Zoom Resizes Windows follows it).
+            let before = app.ui.views.get(w.document).cloned();
+            let active_before = active_document_id(app);
+            crate::shortcuts::handle_forwarded(app, ctx, keys, modifiers);
+            if let Some(after) = app.ui.views.get(w.document).filter(|after| before.as_ref() != Some(*after)) {
+                view = after.clone();
+                ctx.request_repaint_of(vid);
+            }
+            // Ctrl+Tab (or closing this document) made another document active: its window, or
+            // the main window when it has a tab, comes forward with the keyboard, as in Photoshop,
+            // so the next keys act on the document that is now active.
+            if active_document_id(app) != active_before {
+                focus_active_document(app, ctx);
+            }
+        }
         if w.floating
             && let Some(stored) = app.ui.views.get_mut(w.document)
         {
@@ -866,6 +891,40 @@ fn window_canvas_id(window: u64) -> egui::Id {
 pub(crate) fn floating_canvas(app: &PhotocraftApp, ctx: &egui::Context, doc: usize) -> Option<(egui::Vec2, f32)> {
     let window = app.ui.windows.iter().find(|w| w.open && w.floating && w.document == doc)?;
     ctx.data(|d| d.get_temp::<(egui::Vec2, f32)>(window_canvas_id(window.id)))
+}
+
+#[cfg(test)]
+mod doc_window_tests;
+
+fn active_document_id(app: &PhotocraftApp) -> Option<photocraft_doc::DocId> {
+    app.session.active().map(|d| d.doc.id)
+}
+
+/// Give the keyboard to the window showing the active document: its own window when it floats,
+/// else the main window, where its tab is (a second view of a tabbed document is not its home).
+fn focus_active_document(app: &PhotocraftApp, ctx: &egui::Context) {
+    let Some(active) = app.session.active_index() else { return };
+    let window = app.ui.windows.iter().find(|w| w.open && w.floating && w.document == active);
+    let viewport = window.map_or(egui::ViewportId::ROOT, |w| egui::ViewportId::from_hash_of(("docwin", w.id)));
+    ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::Focus);
+}
+
+/// The keys, text and clipboard events a document window's pass left over for the shortcuts,
+/// with the modifiers held there. Nothing while one of its widgets has keyboard focus: its keys
+/// are its own.
+fn leftover_keys(ctx: &egui::Context) -> (Vec<egui::Event>, egui::Modifiers) {
+    if ctx.memory(|m| m.focused().is_some()) {
+        return (Vec::new(), egui::Modifiers::default());
+    }
+    ctx.input(|i| {
+        let keys = i
+            .events
+            .iter()
+            .filter(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)))
+            .cloned()
+            .collect();
+        (keys, i.modifiers)
+    })
 }
 
 /// Window › Arrange tiles: each document shown with its tile in `rect`, or `None` when the
