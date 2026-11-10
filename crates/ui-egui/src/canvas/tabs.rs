@@ -808,11 +808,13 @@ pub fn extra_windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let mut closing = Vec::new();
     // Floating windows closed this frame while another window of their document was open.
     let mut floating_closed = Vec::new();
+    // In front of the main window while the app is in use (`doc_window_level`).
+    let level = super::doc_window_level::frame_level(app, ctx, wins.iter().any(|w| w.open));
     for w in wins.into_iter().filter(|w| w.open) {
         let Some(st) = app.session.documents().get(w.document) else { continue };
         let title = format!("{} — window {}", st.doc.name, w.id);
         let vid = egui::ViewportId::from_hash_of(("docwin", w.id));
-        let mut builder = crate::os_window::builder().with_title(title).with_inner_size([800.0, 600.0]);
+        let mut builder = crate::os_window::builder().with_title(title).with_inner_size([800.0, 600.0]).with_window_level(level);
         if let Some([x, y]) = w.position {
             builder = builder.with_position([x, y]);
         }
